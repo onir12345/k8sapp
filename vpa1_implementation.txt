@@ -1,0 +1,262 @@
+In addition to the Horizontal Pod Autoscaler (HPA), which creates additional pods if the existing ones start using more CPU/Memory than configured in the HPA limits, there is also the Vertical Pod Autoscaler (VPA), which works according to a different scheme: instead of horizontal scaling, i.e. increasing the number of Pods, it changes resources.requests of a Pod, which causes the Kubernetes Scheduler to “relocate” this Pod to another WorkerNode if the current one runs out of resources.
+That is, VPA constantly monitors the consumption of resources by containers in pods and changes the value according to the actual consumption of resources, and can both increase the value of the requests and decrease it, thus automatically adjusting the needs of a Pod to avoid irrational use of resources of Kubernetes cluster instances and ensure the Pod has sufficient CPU time and memory.
+Vertical Pod Autoscaler components
+After deploying VPA, it creates three Pods for its work:
+    • recommender: monitors the use of resources by Pods, and issues its recommendations on the value of CPU/Mem requests that should be set for Pods
+    • updater: monitors Pods and their current values ​​of CPU/Mem requests, and if these values ​​do not match the values ​​from the Recommender, it “kills” them (the EvictedByVPA Kubernetes event ) so that the Kubernetes controllers (Deployment, ReplicaSet, StatefulSet, etc) recreate them with the required values
+    • admission-plugin: actually sets the value of the requests for new Pods, or those that were transformed after the Updater killed them
+Vertical Pod Autoscaler limitations
+When using VPA, keep in mind that:
+    • VPA does not monitor the process of re-creating pods, i.e. after the Pod has been evicted — its creation already depends entirely on Kubernetes. If there are no free WorkerNodes in the cluster at the time the Pods are recreated, the Pod may remain in the Pending status, so it is good to have the Cluster Autoscaler or Karpenter that will launch a new node
+    • VPA cannot be used together with the HPA if scaling is set to CPU/Memory, but they can be used if HPA is set to custom metrics
+    • also keep in mind the fact that VPA recreates Pods during operation, i.e. if you do not have some fault-tolerant solution in the form of additional Pods that can take over the load during the Pod recreation, then the service will be unavailable until the corresponding controller (ReplicaSet, StatefulSet, etc) will launch a new Pod instance
+See more in Known limitations.
+Running Vertical Pod Autoscaler
+For the work, VPA relies on the Kubernetes Metrics Server to get a Pod’s CPU/Mem values, but can also use Prometheus, see How can I use Prometheus as a history provider for the VPA recommender.
+Installing Metrics Server
+Since we will be testing VPA in a Minikube instance, first install the Metrics Server plugin:
+$ minikube addons enable metrics-server
+Or in the case of a regular Kubernetes cluster — from the Helm chart:
+$ helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+$ helm -n kube-system upgrade --install metrics-server metrics-server/metrics-server
+And check if kubectl top pod works, as it takes data from the Metrics Server:
+$ kubectl top pod --all-namespaces
+NAMESPACE NAME CPU(cores) MEMORY(bytes)
+kube-system etcd-minikube 83m 33Mi
+kube-system kube-apiserver-minikube 249m 254Mi
+kube-system kube-controller-manager-minikube 54m 45Mi
+kube-system kube-scheduler-minikube 26m 22Mi
+Installing Vertical Pod Autoscaler
+Here, let’s also use the Helm chart cowboysysop/vertical-pod-autoscaler:
+$ helm repo add cowboysysop https://cowboysysop.github.io/charts/
+helm -n kube-system upgrade -install vertical-pod-autoscaler cowboysysop/vertical-pod-autoscaler
+Check VPA’s Pods:
+$ kubectl -n kube-system get pod -l app.kubernetes.io/name=vertical-pod-autoscaler
+NAME READY STATUS RESTARTS AGE
+vertical-pod-autoscaler-admission-controller-655f9b57d7-q85kc 1/1 Running 0 58s
+vertical-pod-autoscaler-recommender-7d964f7894-k87hb 1/1 Running 0 58s
+vertical-pod-autoscaler-updater-7ff97c4d85-vfjkj 1/1 Running 0 58s
+And its CustomResourceDefinitions:
+$ kubectl get crd
+NAME CREATED AT
+verticalpodautoscalercheckpoints.autoscaling.k8s.io 2023–04–27T08:38:16Z
+verticalpodautoscalers.autoscaling.k8s.io 2023–04–27T08:38:16Z
+Now everything is ready to start using it.
+Examples of work with Vertical Pod Autoscaler
+In the VPA repository, there is a directory named examples, which contains examples of manifests, and in the hamster.yaml file there is an example of a configured VPA and a test Deployment.
+But let’s create our manifests and deploy resources separately.
+First, describe a Deployment:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hamster
+spec:
+  selector:
+    matchLabels:
+      app: hamster
+    replicas: 2
+    template:
+      metadata:
+        labels:
+          app: hamster
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534 # nobody
+        containers:
+          - name: hamster
+            image: registry.k8s.io/ubuntu-slim:0.1
+            resources:
+              requests:
+                cpu: 100m
+                memory: 50Mi
+            command: ["/bin/sh"]
+            args:
+            - "-c"
+            - "while true; do timeout 0.5s yes >/dev/null; sleep 0.5s; done"
+Here we have to create two Pods with requests at 100 Milicpu and 50 Megabyte memory.
+Deploy it:
+$ kubectl apply -f hamster-deployment.yaml
+deployment.apps/hamster created
+In a minute or two, check the resources that are actually consumed by the Pods:
+$ kubectl top pod
+NAME CPU(cores) MEMORY(bytes)
+hamster-65cd4dd797-fq9lq 498m 0Mi
+hamster-65cd4dd797-lnpks 499m 0Mi
+Now, add a VPA:
+apiVersion: "autoscaling.k8s.io/v1"
+kind: VerticalPodAutoscaler
+metadata:
+  name: hamster-vpa
+spec:
+# recommenders field can be unset when using the default recommender.
+# When using an alternative recommender, the alternative recommender’s name
+# can be specified as the following in a list.
+# recommenders:
+# — name: ‘alternative’
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: hamster
+  resourcePolicy:
+    containerPolicies:
+    - containerName: '*'
+      minAllowed:
+        cpu: 100m
+        memory: 50Mi
+      maxAllowed:
+        cpu: 1
+        memory: 500Mi
+      controlledResources: ["cpu", "memory"]
+Deploy it:
+$ kubectl apply -f hamster-vpa.yaml
+verticalpodautoscaler.autoscaling.k8s.io/hamster-vpa created
+Check the VPA object:
+$ kubectl get vpa
+NAME MODE CPU MEM PROVIDED AGE
+hamster-vpa Auto 14s
+And in a minute or two, the Recommender starts working:
+$ kubectl get vpa
+NAME MODE CPU MEM PROVIDED AGE
+hamster-vpa Auto 587m 262144k True 43s
+And in another minute, check the Updater work — it kills old Pods to apply new recommended values for the requests:
+$ kubectl get pod
+NAME READY STATUS RESTARTS AGE
+hamster-65cd4dd797-fq9lq 1/1 Terminating 0 3m43s
+hamster-65cd4dd797-hc9cn 1/1 Running 0 13s
+hamster-65cd4dd797-lnpks 1/1 Running 0 3m43s
+Check the value requests of the new Pod:
+$ kubectl get pod hamster-65cd4dd797-hc9cn -o yaml | yq ‘.spec.containers[].resources’
+{
+“requests”: {
+“cpu”: “587m”,
+“memory”: “262144k”
+}
+}
+Now that we’ve seen VPA in action, let’s take a look at its API and available options.
+Vertical Pod Autoscaler API reference and parameters
+For a full description, see the API reference, and now let’s just make describe of our existing VPA to understand what’s there:
+$ kubectl describe vpa/hamster-vpa
+Name: hamster-vpa
+Namespace: default
+Labels: <none>
+Annotations: <none>
+API Version: autoscaling.k8s.io/v1
+Kind: VerticalPodAutoscaler
+Metadata:
+Creation Timestamp: 2023–04–27T09:05:41Z
+Generation: 61
+Resource Version: 7016
+UID: 227c0ce6–7f86–4bff-b9b5-d88914f90bec
+Spec:
+Resource Policy:
+Container Policies:
+Container Name: *
+Controlled Resources:
+cpu
+memory
+Max Allowed:
+Cpu: 1
+Memory: 500Mi
+Min Allowed:
+Cpu: 100m
+Memory: 50Mi
+Target Ref:
+API Version: apps/v1
+Kind: Deployment
+Name: hamster
+Update Policy:
+Update Mode: Auto
+Status:
+Conditions:
+Last Transition Time: 2023–04–27T09:06:11Z
+Status: True
+Type: RecommendationProvided
+Recommendation:
+Container Recommendations:
+Container Name: hamster
+Lower Bound:
+Cpu: 569m
+Memory: 262144k
+Target:
+Cpu: 587m
+Memory: 262144k
+Uncapped Target:
+Cpu: 587m
+Memory: 262144k
+Upper Bound:
+Cpu: 1
+Memory: 262144k
+Events: <none>
+Or in “pure” YAML:
+$ kubectl get vpa/hamster-vpa -o yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+…
+spec:
+resourcePolicy:
+containerPolicies:
+- containerName: ‘*’
+controlledResources:
+- cpu
+- memory
+maxAllowed:
+cpu: 1
+memory: 500Mi
+minAllowed:
+cpu: 100m
+memory: 50Mi
+targetRef:
+apiVersion: apps/v1
+kind: Deployment
+name: hamster
+updatePolicy:
+updateMode: Auto
+status:
+…
+recommendation:
+containerRecommendations:
+- containerName: hamster
+lowerBound:
+cpu: 570m
+memory: 262144k
+target:
+cpu: 587m
+memory: 262144k
+uncappedTarget:
+cpu: 587m
+memory: 262144k
+upperBound:
+cpu: “1”
+memory: 262144k
+And now let’s spill the parameters from our VPA and others that may be useful to us in the future:
+    • spec (VerticalPodAutoscalerSpec):
+    • targetRef: a controller type responsible for the Pods that will be scaled by this VPA
+    • updatePolicy (PodUpdatePolicy): Specifies whether the policy will be applied when a Pod is created and whether it will be applied during its life
+    • updateMode: can have values “Off“, “Initial“, “Recreate“, and “Auto” (the default one):
+    • Off: will not apply new values, only enter them into the field status (see below)
+    • Initial: will apply the value only when a Pod is created
+    • Recreate: will apply a value when a Pod is created and during its lifecycle
+    • Auto: at the moment, it does the same thing as Recreate (although four years ago it was said that it was planned to change requests without a restart)
+    • minReplicas: a minimum number of Pods that must be in the Running status for VPA Updater to perform the Pod Eviction action to apply new values ​​in requests
+    • resourcePolicy (PodResourcePolicy): sets the parameters of how CPU and Memory requests will be configured for specific containers, if not specified, then VPA will apply a new values ​​to all containers in a Pod
+    • containerPolicies (ContainerResourcePolicy): a Settings for specific containers, or for all (with thecontainerName = '*') that don’t have their own options
+    • containerName: the name of the container for which the parameters are described
+    • mode: specifies whether the recommendations will be applied when the container is created and whether they will be applied during its operation, can be “ Off ” or “ Auto ” (default value)
+    • minAllowed and maxAllowed: sets a minimum and maximum values ​​for CPU/Memory requests
+    • ControlledResources: which type of resources to check to apply recommendations – ResourceCPU, ResourceMemory, or both (default both if none is specified)
+    • status (VerticalPodAutoscalerStatus): latest recommendations from Recommender
+    • recommendation (RecommendedPodResources): latest recommended CPU/Memory values
+    • containerRecommendations (RecommendedContainerResources): recommendations for each container
+    • containerName: a container name
+    • target: recommended values ​​for the container
+    • lowerBound: a minimum possible recommended values ​​for the container
+    • upperBound: a maximum possible recommended values ​​for the container
+    • uncappedTarget: latest recommended values ​​of CPU/Memory based on actual resource consumption without taking into account the ContainerResourcePolicy (i.e. without minAllowed and maxAllowed), not taken into account by Recommender, displayed for information only
+That’s all for now.
+Sometimes, there are issues with VPA, but in general, it works without problems in our Production EKS clusters, for example, for the Prometheus server.
+Originally published at RTFM: Linux, DevOps, and system administration.
+Kubernetes
+Monitoring
+
+
